@@ -3,7 +3,7 @@ from __future__ import with_statement, print_function, absolute_import
 
 
 def wavenet(out_channels=256,
-            layers=20,
+            layers=16,
             stacks=2,
             residual_channels=512,
             gate_channels=512,

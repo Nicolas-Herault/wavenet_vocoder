@@ -45,6 +45,7 @@ from nnmnkwii import preprocessing as P
 from nnmnkwii.datasets import FileSourceDataset, FileDataSource
 
 import librosa.display
+from librosa import load
 
 from sklearn.model_selection import train_test_split
 from keras.utils import np_utils
@@ -66,6 +67,26 @@ use_cuda = torch.cuda.is_available()
 if use_cuda:
     cudnn.benchmark = False
 
+def normalize(data):
+    temp = np.float32(data) - np.min(data)
+    out = (temp / np.max(temp) - 0.5) * 2
+    return out
+
+
+def make_batch(path, sample_rate):
+
+    quantification = 256
+    data = load(path, sample_rate)[0]
+    data_ = normalize(data)
+
+    bins = np.linspace(-1, 1, quantification)
+    # Quantize inputs.
+    inputs = np.digitize(data_[0:-1], bins, right=False) - 1
+    inputs = bins[inputs][None, :, None]
+
+    # Encode targets as ints.
+    targets = (np.digitize(data_[1::], bins, right=False) - 1)[None, :]
+    return targets
 
 def sanity_check(model, c, g):
     if model.has_speaker_embedding():
@@ -616,12 +637,12 @@ def __train_step(device, phase, epoch, global_step, global_test_step,
                  model, optimizer, writer, criterion,
                  x, y, c, g, input_lengths,
                  checkpoint_dir, eval_dir=None, do_eval=False, ema=None):
-    sanity_check(model, c, g)
 
     # x : (B, C, T)
     # y : (B, T, 1)
     # c : (B, C, T)
     # g : (B,)
+
     train = (phase == "train")
     clip_thresh = hparams.clip_thresh
     if train:
@@ -643,7 +664,7 @@ def __train_step(device, phase, epoch, global_step, global_test_step,
 
     # Prepare data
     x, y = x.to(device), y.to(device)
-    input_lengths = input_lengths.to(device)
+    input_lengths = torch.LongTensor(input_lengths).to(device)
     c = c.to(device) if c is not None else None
     g = g.to(device) if g is not None else None
 
@@ -700,55 +721,25 @@ def __train_step(device, phase, epoch, global_step, global_test_step,
     return loss.item()
 
 
-def train_loop(device, model, data_loaders, optimizer, writer, checkpoint_dir=None):
-    if is_mulaw_quantize(hparams.input_type):
-        criterion = MaskedCrossEntropyLoss()
-    else:
-        criterion = DiscretizedMixturelogisticLoss()
+def train_loop(device, model, x, y, optimizer, writer, checkpoint_dir=None):
 
-    if hparams.exponential_moving_average:
-        ema = ExponentialMovingAverage(hparams.ema_decay)
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                ema.register(name, param.data)
-    else:
-        ema = None
+    criterion = DiscretizedMixturelogisticLoss()
 
     global global_step, global_epoch, global_test_step
     while global_epoch < hparams.nepochs:
-        for phase, data_loader in data_loaders.items():
-            train = (phase == "train")
+        for wavfile in x :
             running_loss = 0.
             test_evaluated = False
-            for step, (x, y, c, g, input_lengths) in tqdm(enumerate(data_loader)):
-                # Whether to save eval (i.e., online decoding) result
-                do_eval = False
-                eval_dir = join(checkpoint_dir, "{}_eval".format(phase))
-                # Do eval per eval_interval for train
-                if train and global_step > 0 \
-                        and global_step % hparams.train_eval_interval == 0:
-                    do_eval = True
-                # Do eval for test
-                # NOTE: Decoding WaveNet is quite time consuming, so
-                # do only once in a single epoch for testset
-                if not train and not test_evaluated \
-                        and global_epoch % hparams.test_eval_epoch_interval == 0:
-                    do_eval = True
-                    test_evaluated = True
-                if do_eval:
-                    print("[{}] Eval at train step {}".format(phase, global_step))
+            input_lengths = wavfile.shape[1]
+            print(input_lengths)
+            for step in tqdm(wavfile[0]):
 
                 # Do step
-                running_loss += __train_step(device,
-                                             phase, global_epoch, global_step, global_test_step, model,
-                                             optimizer, writer, criterion, x, y, c, g, input_lengths,
-                                             checkpoint_dir, eval_dir, do_eval, ema)
+                running_loss += __train_step(device, "train", global_epoch, global_step, global_test_step, model,
+                                             optimizer, writer, criterion, x, y, None, None, input_lengths, checkpoint_dir, None, False, None)
 
                 # update global state
-                if train:
-                    global_step += 1
-                else:
-                    global_test_step += 1
+                global_step += 1
 
             # log per epoch
             averaged_loss = running_loss / len(data_loader)
@@ -849,7 +840,6 @@ def load_checkpoint(path, model, optimizer, reset_optimizer):
     return model
 
 
-# https://discuss.pytorch.org/t/how-to-load-part-of-pre-trained-model/1113/3
 def restore_parts(path, model):
     print("Restore part of the model from: {}".format(path))
     state = _load(path)["state_dict"]
@@ -872,67 +862,9 @@ def restore_parts(path, model):
                 warn("{}: may contain invalid size of weight. skipping...".format(k))
 
 
-def get_data_loaders(data_root, speaker_id, test_shuffle=True):
-    data_loaders = {}
-    local_conditioning = hparams.cin_channels > 0
-    for phase in ["train", "test"]:
-        train = phase == "train"
-        X = FileSourceDataset(RawAudioDataSource(data_root, speaker_id=speaker_id,
-                                                 train=train,
-                                                 test_size=hparams.test_size,
-                                                 test_num_samples=hparams.test_num_samples,
-                                                 random_state=hparams.random_state))
-        if local_conditioning:
-            Mel = FileSourceDataset(MelSpecDataSource(data_root, speaker_id=speaker_id,
-                                                      train=train,
-                                                      test_size=hparams.test_size,
-                                                      test_num_samples=hparams.test_num_samples,
-                                                      random_state=hparams.random_state))
-            assert len(X) == len(Mel)
-            print("Local conditioning enabled. Shape of a sample: {}.".format(
-                Mel[0].shape))
-        else:
-            Mel = None
-        print("[{}]: length of the dataset is {}".format(phase, len(X)))
-
-        if train:
-            lengths = np.array(X.file_data_source.lengths)
-            # Prepare sampler
-            sampler = PartialyRandomizedSimilarTimeLengthSampler(
-                lengths, batch_size=hparams.batch_size)
-            shuffle = False
-            # make sure that there's no sorting bugs for https://github.com/r9y9/wavenet_vocoder/issues/130
-            sampler_idx = np.asarray(sorted(list(map(lambda s: int(s), sampler))))
-            assert (sampler_idx == np.arange(len(sampler_idx), dtype=np.int)).all()
-        else:
-            sampler = None
-            shuffle = test_shuffle
-
-        dataset = PyTorchDataset(X, Mel)
-        data_loader = data_utils.DataLoader(
-            dataset, batch_size=hparams.batch_size,
-            num_workers=hparams.num_workers, sampler=sampler, shuffle=shuffle,
-            collate_fn=collate_fn, pin_memory=hparams.pin_memory)
-
-        speaker_ids = {}
-        if X.file_data_source.multi_speaker:
-            for idx, (x, c, g) in enumerate(dataset):
-                if g is not None:
-                    try:
-                        speaker_ids[g] += 1
-                    except KeyError:
-                        speaker_ids[g] = 1
-            if len(speaker_ids) > 0:
-                print("Speaker stats:", speaker_ids)
-
-        data_loaders[phase] = data_loader
-
-    return data_loaders
-
-
 if __name__ == "__main__":
     args = docopt(__doc__)
-    print("Command line args:\n", args)
+    #print("Command line args:\n", args)
     checkpoint_dir = args["--checkpoint-dir"]
     checkpoint_path = args["--checkpoint"]
     checkpoint_restore_parts = args["--restore-parts"]
@@ -942,7 +874,7 @@ if __name__ == "__main__":
 
     data_root = args["--data-root"]
     if data_root is None:
-        data_root = join(dirname(__file__), "data", "ljspeech")
+        data_root = join(dirname(__file__), "data")
 
     log_event_path = args["--log-event-path"]
     reset_optimizer = args["--reset-optimizer"]
@@ -954,14 +886,12 @@ if __name__ == "__main__":
     # Override hyper parameters
     hparams.parse(args["--hparams"])
     assert hparams.name == "wavenet_vocoder"
-    print(hparams_debug_string())
+    #print(hparams_debug_string())
 
     fs = hparams.sample_rate
 
-    os.makedirs(checkpoint_dir, exist_ok=True)
-
-    # Dataloader setup
-    data_loaders = get_data_loaders(data_root, speaker_id, test_shuffle=True)
+    if os.path.isdir(checkpoint_dir) == False :
+        os.makedirs(checkpoint_dir)
 
     device = torch.device("cuda" if use_cuda else "cpu")
 
@@ -991,10 +921,46 @@ if __name__ == "__main__":
     print("TensorBoard event log path: {}".format(log_event_path))
     writer = SummaryWriter(log_dir=log_event_path)
 
+    # Preprocess the datasets
+
+    inputlist, targetlist = [], []
+    for file in os.listdir(data_root):
+        if file.endswith(".wav"):
+            path = os.path.join(data_root, file)
+            inputs = make_batch(path, hparams.sample_rate)
+            inputlist.append(inputs)
+
+    inputlist = np.stack(inputlist)
+    x = torch.FloatTensor(inputlist)
+
+    y_list = [[x.shape[0]], [x.shape[2]], [1]]
+    y = torch.tensor(y_list)
+
+    # x : (B, C, T)
+    # y : (B, T, 1)
+    # c : (B, C, T)
+    # g : (B,)
+
+    #print('The input shape is of the input tensor is : ', x.shape)
+    #print('The model is : ', model)
+
     # Train!
     try:
-        train_loop(device, model, data_loaders, optimizer, writer,
-                   checkpoint_dir=checkpoint_dir)
+        train_loop(device, model, x, y, optimizer, writer, checkpoint_dir=checkpoint_dir)
+
+        '''for e in range(hparams.nepochs) :
+            loss = 0.
+            print('Starting epoch number : {}'.format(e))
+
+            for step in tqdm(range(tensor.shape[2])) :
+                loss += __train_step(device, "train", e, step, None,
+                                 model, optimizer, writer, nn.CrossEntropyLoss(reduce=False),
+                                 tensor, y, None, None, tensor.shape[2],
+                                 checkpoint_dir, eval_dir=None, do_eval=False, ema=None)
+
+            if step % 100 == 0 :
+                print('The actual loss at step {} is {}'.format(step, loss))'''
+
     except KeyboardInterrupt:
         print("Interrupted!")
         pass
@@ -1003,5 +969,3 @@ if __name__ == "__main__":
             device, model, optimizer, global_step, checkpoint_dir, global_epoch)
 
     print("Finished")
-
-    sys.exit(0)

@@ -20,7 +20,7 @@ class Conv1d(nn.Conv1d):
             raise RuntimeError('incremental_forward only supports eval mode')
 
         # run forward pre hooks (e.g., weight norm)
-        for hook in self._forward_pre_hooks.values():
+        for hook in list(self._forward_pre_hooks.values()):
             hook(self, input)
 
         # reshape weight

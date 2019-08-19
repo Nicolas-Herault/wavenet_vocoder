@@ -19,7 +19,7 @@ from hparams import hparams
 
 
 def preprocess(mod, in_dir, out_root, num_workers):
-    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(out_dir)
     metadata = mod.build_from_path(in_dir, out_dir, num_workers, tqdm=tqdm)
     write_metadata(metadata, out_dir)
 
@@ -45,10 +45,6 @@ if __name__ == "__main__":
     num_workers = cpu_count() if num_workers is None else int(num_workers)
     preset = args["--preset"]
 
-    # Load preset if specified
-    if preset is not None:
-        with open(preset) as f:
-            hparams.parse_json(f.read())
     # Override hyper parameters
     hparams.parse(args["--hparams"])
     assert hparams.name == "wavenet_vocoder"

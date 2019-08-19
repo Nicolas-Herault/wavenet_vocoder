@@ -97,7 +97,7 @@ class WaveNet(nn.Module):
           compatibility.
     """
 
-    def __init__(self, out_channels=256, layers=20, stacks=2,
+    def __init__(self, out_channels=256, layers=16, stacks=2,
                  residual_channels=512,
                  gate_channels=512,
                  skip_out_channels=512,
